@@ -1,0 +1,54 @@
+#!/usr/bin/bash
+# plasma-session -- start Plasma with its own config home, away from Hyprland's
+# usage: plasma-session [wayland|x11]
+
+set -u
+
+LOG="${HOME}/.local/state/plasma-session.log"
+mkdir -p "${LOG%/*}"
+exec >"$LOG" 2>&1          # truncated each login; read this if a session fails
+
+export XDG_CONFIG_HOME="${HOME}/.config-plasma"
+"${HOME}/.local/bin/plasma-config-sync" || echo "warn: config sync failed, continuing"
+
+# yabridge + Bottles, scoped to this session only.
+# WINELOADER makes yabridge's Wine plugin hosts use the runner configured for
+# each Bottle instead of the system Wine. Setting it here rather than in
+# ~/.config/environment.d keeps it out of the Hyprland session entirely, and it
+# is also the only reliable place under greetd: the systemd --user manager
+# starts before this wrapper runs, so it would read ~/.config/environment.d
+# (the shared one) and apply it to every session.
+if [[ -x "${HOME}/.local/bin/wineloader.sh" ]]; then
+    export WINELOADER="${HOME}/.local/bin/wineloader.sh"
+    echo "WINELOADER=$WINELOADER"
+fi
+# yabridgectl on PATH, so it is managed from inside the session that uses it.
+# Its config lives in $XDG_CONFIG_HOME/yabridgectl, i.e. the isolated one.
+if [[ -d "${HOME}/.local/share/yabridge" ]]; then
+    export PATH="${PATH}:${HOME}/.local/share/yabridge"
+fi
+
+# The systemd --user manager can outlive this session. startplasma pushes this
+# session's environment into it, so both variables have to be taken back out
+# or a later Hyprland session could inherit them.
+cleanup() {
+    systemctl --user unset-environment XDG_CONFIG_HOME WINELOADER >/dev/null 2>&1 || true
+}
+trap cleanup EXIT INT TERM
+
+echo "=== plasma-session $(date -Iseconds) mode=${1:-wayland} XDG_CONFIG_HOME=$XDG_CONFIG_HOME ==="
+
+case "${1:-wayland}" in
+    x11)
+        # greetd gives us a VT via pam_systemd; startx picks it up from XDG_VTNR
+        startx /usr/bin/startplasma-x11
+        ;;
+    *)
+        startplasma-wayland
+        ;;
+esac
+rc=$?
+
+echo "=== session exited rc=$rc $(date -Iseconds) ==="
+cleanup
+exit $rc

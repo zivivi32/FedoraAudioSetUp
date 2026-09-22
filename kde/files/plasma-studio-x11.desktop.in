@@ -1,0 +1,6 @@
+[Desktop Entry]
+Name=Plasma Studio (X11)
+Comment=KDE Plasma on Xorg, isolated config home - best for Wine-hosted plugin GUIs
+Exec=@WRAPPER@ x11
+Type=Application
+DesktopNames=KDE

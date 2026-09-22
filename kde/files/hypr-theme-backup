@@ -1,0 +1,53 @@
+#!/usr/bin/bash
+# hypr-theme-backup save|restore
+#
+# Snapshot of the files that decide how the Hyprland session looks.
+# The isolated Plasma session cannot touch anything under ~/.config, but two
+# paths live outside XDG_CONFIG_HOME (~/.gtkrc-2.0, ~/.icons/default) and the
+# stock "Plasma" greeter entry bypasses the isolation entirely -- this puts
+# everything back in one command.
+
+set -u
+BAK="${HOME}/.local/state/hyprland-theme-backup"
+
+# paths relative to $HOME
+ITEMS=(
+    .config/kdeglobals .config/kdedefaults
+    .config/gtk-2.0 .config/gtk-3.0 .config/gtk-4.0
+    .config/xsettingsd .config/dconf .config/mimeapps.list
+    .config/qt5ct .config/qt6ct .config/Trolltech.conf
+    .gtkrc-2.0 .gtkrc-2.0-kde4 .icons/default
+)
+
+case "${1:-}" in
+save)
+    n=0
+    for i in "${ITEMS[@]}"; do
+        [[ -e ${HOME}/$i ]] || continue
+        mkdir -p "$BAK/${i%/*}"
+        rm -rf "${BAK:?}/$i"
+        cp -a "${HOME}/$i" "$BAK/$i"
+        n=$((n + 1))
+    done
+    date -Iseconds > "$BAK/.saved-at"
+    echo "saved $n item(s) to $BAK"
+    ;;
+restore)
+    [[ -d $BAK ]] || { echo "no backup at $BAK"; exit 1; }
+    n=0
+    for i in "${ITEMS[@]}"; do
+        [[ -e $BAK/$i ]] || continue
+        mkdir -p "${HOME}/${i%/*}"
+        rm -rf "${HOME:?}/$i"
+        cp -a "$BAK/$i" "${HOME}/$i"
+        n=$((n + 1))
+    done
+    echo "restored $n item(s) from $BAK (taken $(cat "$BAK/.saved-at" 2>/dev/null))"
+    echo "log out and back into Hyprland for everything to pick it up"
+    ;;
+list)
+    find "$BAK" -mindepth 1 -maxdepth 2 2>/dev/null | sed "s|$BAK/||"
+    ;;
+*)
+    echo "usage: ${0##*/} save|restore|list"; exit 2 ;;
+esac

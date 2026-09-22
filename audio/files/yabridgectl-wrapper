@@ -1,0 +1,12 @@
+#!/usr/bin/bash
+# yabridgectl wrapper, installed as ~/.local/bin/yabridgectl.
+#
+# yabridgectl stores its config under $XDG_CONFIG_HOME. On this machine the
+# Plasma session runs with XDG_CONFIG_HOME=~/.config-plasma while every other
+# session uses ~/.config, so the same command would read a different config
+# depending on where you ran it -- and an "add" from the wrong session silently
+# goes nowhere. Pin it, so there is exactly one yabridgectl config.
+if [[ -d "${HOME}/.config-plasma" ]]; then
+    export XDG_CONFIG_HOME="${HOME}/.config-plasma"
+fi
+exec "${HOME}/.local/share/yabridge/yabridgectl" "$@"

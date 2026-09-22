@@ -1,0 +1,6 @@
+[Desktop Entry]
+Name=Plasma Studio
+Comment=KDE Plasma on Wayland, isolated config home
+Exec=@WRAPPER@ wayland
+Type=Application
+DesktopNames=KDE

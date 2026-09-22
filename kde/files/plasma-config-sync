@@ -1,0 +1,66 @@
+#!/usr/bin/bash
+# plasma-config-sync -- keep ~/.config-plasma in sync with ~/.config
+#
+# The Plasma session runs with XDG_CONFIG_HOME=~/.config-plasma so Plasma and
+# System Settings can never rewrite the theming files the Hyprland session
+# reads.  Everything that is NOT a known conflict file is exposed to Plasma as
+# a symlink into the real ~/.config, so app configs stay shared and identical.
+#
+# Idempotent; the Plasma session wrapper runs it at every login.
+
+set -u
+
+SRC="${HOME}/.config"
+DST="${PLASMA_CONFIG_HOME:-${HOME}/.config-plasma}"
+
+# Entries Plasma keeps private: real files inside $DST, never symlinked out.
+# These are what Plasma / System Settings / kde-gtk-config write to and what
+# the Hyprland session reads for its look and its defaults.
+PRIVATE=(
+    kdeglobals                 # Qt/KDE colours, widget style, icon theme, fonts
+    kdedefaults                # look-and-feel defaults dropped by Plasma
+    gtk-2.0 gtk-3.0 gtk-4.0    # kde-gtk-config rewrites settings.ini
+    xsettingsd                 # kde-gtk-config rewrites xsettingsd.conf
+    dconf                      # gsettings org.gnome.desktop.interface (GTK theme)
+    mimeapps.list              # default applications
+    qt5ct qt6ct                # Hyprland-side Qt theming, Plasma must not use it
+    Trolltech.conf             # legacy Qt settings
+)
+
+is_private() {
+    local n=$1 p
+    for p in "${PRIVATE[@]}"; do [[ $n == "$p" ]] && return 0; done
+    return 1
+}
+
+mkdir -p "$DST" || exit 1
+shopt -s dotglob nullglob
+
+# 1. expose every shared entry of ~/.config that Plasma is not allowed to own
+for path in "$SRC"/*; do
+    name=${path##*/}
+    target="$DST/$name"
+
+    if is_private "$name"; then
+        # a stale link from an earlier run would expose the shared file
+        [[ -L $target ]] && rm -f "$target"
+        continue
+    fi
+
+    if [[ -L $target ]]; then
+        [[ $(readlink "$target") == "$path" ]] || ln -sfn "$path" "$target"
+    elif [[ -e $target ]]; then
+        :   # Plasma made something real here, leave it alone
+    else
+        ln -s "$path" "$target"
+    fi
+done
+
+# 2. drop links whose target disappeared from ~/.config
+for target in "$DST"/*; do
+    [[ -L $target ]] || continue
+    [[ -e $target ]] || rm -f "$target"
+done
+
+shopt -u dotglob nullglob
+exit 0
