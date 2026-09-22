@@ -37,6 +37,8 @@ DO_REAPER=1
 DO_YABRIDGE=0
 DO_NI_WINE=0
 YABRIDGE_CHANNEL=auto
+DO_ROUTE_PREFIXES=0
+ROUTE_RUNNER=""
 CHECK_ONLY=0
 FORCE=0
 YES="${ASSUME_YES:-0}"
@@ -61,6 +63,12 @@ and sysctl tuning, adds you to the 'pipewire' group, and installs REAPER.
   --yabridge-stable   force the pinned stable yabridge 5.1.1 instead of the
                       development build. Only correct if your system Wine is
                       older than 9.22 (see yabridge issue #382)
+  --route-prefixes    give every Wine prefix yabridge scans a bottle.yml, so
+                      the wineloader shim routes it to a Bottles runner instead
+                      of silently falling back to the system Wine. Without this
+                      an unrouted prefix is only reported, never changed
+  --route-runner NAME runner --route-prefixes should point those prefixes at
+                      (default: the runner the first configured Bottle uses)
   --force             skip the safety check guarding --mask-rtkit
   -y, --yes           never prompt
   -h, --help          this message
@@ -77,6 +85,8 @@ while [[ $# -gt 0 ]]; do
         --yabridge)       DO_YABRIDGE=1 ;;
         --ni-wine)        DO_NI_WINE=1 ;;
         --yabridge-stable) YABRIDGE_CHANNEL=stable ;;
+        --route-prefixes) DO_ROUTE_PREFIXES=1 ;;
+        --route-runner)   ROUTE_RUNNER="${2:-}"; [[ -n $ROUTE_RUNNER ]] || { echo "--route-runner needs a runner name" >&2; exit 2; }; shift ;;
         --force)          FORCE=1 ;;
         -y|--yes)         YES=1 ;;
         -h|--help)        usage; exit 0 ;;
@@ -234,6 +244,133 @@ yabridge_installed_ver() {
     "$b" --version 2>/dev/null | awk '{print $NF}' | head -1
 }
 
+# ---------------------------------------------------------------------------
+# Watchdogs: three ways this setup installs "successfully" and still does not
+# work. All three are silent -- nothing fails, the thing just never appears or
+# quietly uses the wrong Wine. Each has a detector here and a fix at its step.
+# ---------------------------------------------------------------------------
+
+REAPER_DESKTOP_ID=cockos-reaper.desktop
+REAPER_DESKTOP_REL=".local/share/applications/$REAPER_DESKTOP_ID"
+REAPER_DESKTOP_LEGACY_REL=".gnome/apps/$REAPER_DESKTOP_ID"
+
+# REAPER's installer runs --integrate-desktop, which calls xdg-desktop-menu.
+# Here that writes the entry to the legacy ~/.gnome/apps -- unread since
+# GNOME 2 -- and tags it "OnlyShowIn=Old" so modern menus skip it as a
+# duplicate of a modern copy that never gets written. REAPER then installs
+# perfectly and is invisible in the launcher. Note that copying the file into
+# place is not enough on its own: OnlyShowIn has to go with it, or every
+# desktop environment still hides it.
+reaper_desktop_ok() {
+    local f="$TARGET_HOME/$REAPER_DESKTOP_REL"
+    [[ -f $f ]] || return 1
+    ! grep -q '^OnlyShowIn=' "$f"
+}
+
+install_reaper_desktop_entry() {
+    local exe="$TARGET_HOME/REAPER/reaper" dest="$TARGET_HOME/$REAPER_DESKTOP_REL"
+    [[ -x $exe ]] || return 1
+    run_user mkdir -p "$(dirname "$dest")"
+    printf '%s\n' \
+        '[Desktop Entry]' \
+        'Type=Application' \
+        'Name=REAPER' \
+        'Comment=Digital audio workstation' \
+        'Categories=AudioVideo;Audio;AudioVideoEditing;Recorder;' \
+        "Exec=\"$exe\" %F" \
+        'Icon=cockos-reaper' \
+        'MimeType=application/x-reaper-project;application/x-reaper-project-backup;application/x-reaper-theme;' \
+        'StartupWMClass=REAPER' \
+        'StartupNotify=true' \
+        'Terminal=false' \
+        | run_user tee "$dest" >/dev/null || return 1
+    run_user chmod 0644 "$dest" || true
+    # The icons are installed correctly by REAPER's own installer, into the
+    # user icon themes, so only the menu caches need a nudge.
+    run_user update-desktop-database "$(dirname "$dest")" >/dev/null 2>&1 || true
+    run_user kbuildsycoca6 --noincremental >/dev/null 2>&1 || true
+    return 0
+}
+
+# Prefixes yabridgectl is configured to scan. A plugin dir is
+# <prefix>/drive_c/Program Files/..., and the prefix containing that drive_c is
+# exactly what yabridge hands the shim as WINEPREFIX.
+yabridge_prefixes() {
+    local cfg; cfg="$(yabridge_config_home)/yabridgectl/config.toml"
+    [[ -f $cfg ]] || return 0
+    grep -oE "'[^']*/drive_c/[^']*'" "$cfg" 2>/dev/null \
+        | tr -d "'" | sed 's#/drive_c/.*##' | sort -u
+}
+
+# wineloader.sh keys off one thing: whether $WINEPREFIX/bottle.yml exists. If it
+# does not, the shim falls through to call_system_wine and the plugin is bridged
+# against whatever Wine dnf ships -- silently, and regardless of which runner
+# yabridge was synced against. Any prefix outside Bottles (~/.wine, ~/.wine-ni)
+# is unrouted by default, which is the single most confusing failure here:
+# everything reports "synced" and the plugins still run on the wrong Wine.
+prefix_routed() { [[ -f "$1/bottle.yml" ]]; }
+
+# Full path of any existing Bottle prefix. Used only as the .Path anchor below.
+# Returns the path, not the bare name: with more than one Bottles root the name
+# alone does not say which root it came from, and the caller needs its runner.
+anchor_bottle() {
+    local root b
+    while read -r root; do
+        [[ -n $root ]] || continue
+        for b in "$root"/*/; do
+            [[ -f "${b}bottle.yml" ]] || continue
+            printf '%s' "${b%/}"; return 0
+        done
+    done < <(bottles_roots)
+    return 1
+}
+
+# Give a non-Bottles prefix the routing a Bottle gets, without making it a
+# Bottle. wineloader.sh reads exactly two keys: .Runner, the runner to exec, and
+# .Path, whose basename only has to match a directory under a Bottles root so
+# BOTTLES_ROOT can be resolved from it. Bottles itself never scans this prefix,
+# so it does not show up in the GUI, and the file dies with the prefix.
+route_prefix() {   # route_prefix <prefix> <runner> <anchor-bottle>
+    local prefix=$1 runner=$2 anchor=$3
+    [[ -d $prefix ]] || return 1
+    printf '%s\n' \
+        '# Written by install-audio.sh. Read only by ~/.local/bin/wineloader.sh,' \
+        '# which needs .Runner and .Path to route this prefix to a Bottles runner' \
+        '# instead of the system Wine. Bottles does not scan this prefix.' \
+        "Runner: $runner" \
+        "Path: $anchor" \
+        | run_user tee "$prefix/bottle.yml" >/dev/null || return 1
+    return 0
+}
+
+# Which Wine a prefix actually resolves to through the shim -- the only answer
+# that matters, since yabridgectl's own "wine_version" is probed globally with
+# no WINEPREFIX and so never reflects the shim at all.
+prefix_wine_version() {
+    local prefix=$1 shim="$TARGET_HOME/.local/bin/wineloader.sh"
+    [[ -x $shim ]] || { wine --version 2>/dev/null; return; }
+    run_user env WINEPREFIX="$prefix" "$shim" --version 2>/dev/null | head -1
+}
+
+# Bottles is a Flatpak and cannot see the host graphics driver; it needs a
+# matching org.freedesktop.Platform.GL.nvidia-<driver> extension. Without one it
+# falls back to Mesa/nouveau, which cannot talk to the proprietary nvidia kernel
+# module, and Bottles dies on its first window with BadDrawable. GL32 counts
+# just as much: Wine needs the 32-bit libraries for 32-bit plugins. Prints the
+# extension suffix when something is missing, nothing when the stack is fine.
+bottles_gl_needed() {
+    local drv slug have
+    [[ -r /proc/driver/nvidia/version ]] || return 0
+    drv="$(modinfo -F version nvidia 2>/dev/null || true)"
+    [[ -n $drv ]] || return 0
+    slug="nvidia-${drv//./-}"
+    have="$(flatpak list --runtime --columns=application 2>/dev/null || true)"
+    if ! grep -qx "org.freedesktop.Platform.GL.$slug" <<<"$have" \
+    || ! grep -qx "org.freedesktop.Platform.GL32.$slug" <<<"$have"; then
+        printf '%s' "$slug"
+    fi
+}
+
 # Is preempt=full already configured in GRUB? Reading that needs root, so this
 # returns 2 ("unknown") rather than prompting for a password during --check.
 grubby_configured() {
@@ -317,6 +454,33 @@ report() {
     printf '  %-24s %s\n' "ni-wine prefix:" "$([[ -d $TARGET_HOME/.wine-ni ]] && echo "$TARGET_HOME/.wine-ni" || echo 'not created')"
     printf '  %-24s %s\n' "bottles runners:" "$(bottles_runners 2>/dev/null | paste -sd' ' - || echo none)"
     printf '  %-24s %s\n' "WINELOADER in session:" "$(wineloader_active_in_session && echo 'active' || echo 'NOT set - log out of Plasma and back in')"
+    printf '  %-24s %s\n' "REAPER launcher entry:" \
+        "$(reaper_desktop_ok && echo "ok (~/$REAPER_DESKTOP_REL)" \
+           || { [[ -f $TARGET_HOME/$REAPER_DESKTOP_LEGACY_REL ]] \
+                && echo 'BROKEN - only the inert ~/.gnome/apps copy exists' \
+                || echo 'missing'; })"
+    # Braces stay out of the expansion here: a literal "{,32}" inside ${gl:+...}
+    # closes the expansion at the wrong }, and the line silently prints garbage.
+    local gl; gl="$(bottles_gl_needed)"
+    if [[ -n $gl ]]; then
+        printf '  %-24s %s\n' "bottles GPU driver:" \
+            "MISSING org.freedesktop.Platform.GL.$gl and GL32.$gl"
+    else
+        printf '  %-24s %s\n' "bottles GPU driver:" "ok"
+    fi
+
+    # Per prefix, because this is decided per prefix: yabridgectl's own
+    # wine_version is a global probe and never sees the shim.
+    local prefix r
+    while read -r prefix; do
+        [[ -n $prefix ]] || continue
+        if prefix_routed "$prefix"; then
+            r="$(bottle_runner "$prefix" 2>/dev/null || true)"
+            printf '  %-24s %s -> %s\n' "prefix routing:" "$prefix" "${r:-?}"
+        else
+            printf '  %-24s %s -> SYSTEM WINE (no bottle.yml)\n' "prefix routing:" "$prefix"
+        fi
+    done < <(yabridge_prefixes)
 }
 
 if [[ $CHECK_ONLY -eq 1 ]]; then
@@ -438,6 +602,21 @@ if [[ $DO_REAPER -eq 1 ]]; then
         run_user touch "$TARGET_HOME/REAPER/reaper.ini"
         run_user rm -rf "$tmp"
         ok "installed to $TARGET_HOME/REAPER (portable)"
+    fi
+
+    # Runs on every pass, not just a fresh install: the entry --integrate-desktop
+    # leaves behind is broken in place, so an install that happened months ago is
+    # exactly the case that needs this.
+    if reaper_desktop_ok; then
+        ok "launcher entry present at ~/$REAPER_DESKTOP_REL"
+    elif install_reaper_desktop_entry; then
+        ok "launcher entry written to ~/$REAPER_DESKTOP_REL, menu cache rebuilt"
+        if [[ -f "$TARGET_HOME/$REAPER_DESKTOP_LEGACY_REL" ]]; then
+            ok "the stale ~/$REAPER_DESKTOP_LEGACY_REL copy is inert; delete it if you like"
+        fi
+    else
+        warn "could not write the REAPER launcher entry"
+        warn "(is $TARGET_HOME/REAPER/reaper missing or not executable?)"
     fi
 fi
 
@@ -656,6 +835,64 @@ for t in glob.glob(os.path.join(d, '*.tar.gz')):
                 fi
             done
         done < <(bottles_roots)
+    fi
+
+    # Prefix routing. yabridgectl will happily report every plugin as "synced"
+    # while the shim quietly bridges them against the system Wine, because the
+    # two never consult each other: sync records a global `wine --version`, and
+    # routing is decided per prefix at load time by whether bottle.yml is there.
+    # So this checks the thing that actually decides, one prefix at a time.
+    unrouted=()
+    while read -r prefix; do
+        [[ -n $prefix ]] || continue
+        prefix_routed "$prefix" || unrouted+=("$prefix")
+    done < <(yabridge_prefixes)
+
+    if [[ ${#unrouted[@]} -eq 0 ]]; then
+        ok "every prefix yabridge scans routes through the shim to a Bottles runner"
+    elif [[ $DO_ROUTE_PREFIXES -eq 1 ]]; then
+        anchor_prefix="$(anchor_bottle || true)"
+        if [[ -z $anchor_prefix ]]; then
+            warn "no Bottle exists yet, so there is nothing to anchor routing to."
+            warn "Create one in Bottles first, then re-run with --route-prefixes."
+        else
+            anchor="$(basename "$anchor_prefix")"
+            runner="$ROUTE_RUNNER"
+            if [[ -z $runner ]]; then
+                runner="$(bottle_runner "$anchor_prefix" || true)"
+            fi
+            if [[ -z $runner || $runner == sys-* ]]; then
+                warn "the anchor Bottle '$anchor' uses runner '${runner:-none}', which is"
+                warn "the system Wine -- routing to it would be a no-op. Pick one with"
+                warn "--route-runner, e.g. --route-runner $YABRIDGE_RUNNER_HINT"
+            else
+                for prefix in "${unrouted[@]}"; do
+                    if route_prefix "$prefix" "$runner" "$anchor"; then
+                        ok "routed $prefix -> $runner"
+                        ok "  now resolves to: $(prefix_wine_version "$prefix")"
+                    else
+                        warn "could not write $prefix/bottle.yml"
+                    fi
+                done
+            fi
+        fi
+    else
+        for prefix in "${unrouted[@]}"; do
+            warn "$prefix has no bottle.yml, so the shim falls back to the system Wine:"
+            warn "  plugins there load under $(prefix_wine_version "$prefix")"
+        done
+        warn "Re-run with --route-prefixes to point them at a Bottles runner instead."
+    fi
+
+    # Bottles owns the Wine runner here, so a Bottles that cannot open is not a
+    # cosmetic problem: there is no other way to configure or change a runner.
+    gl_slug="$(bottles_gl_needed)"
+    if [[ -n $gl_slug ]]; then
+        warn "Bottles has no matching NVIDIA driver inside the Flatpak sandbox."
+        warn "It will crash on its first window with a BadDrawable X error. Fix:"
+        warn "  flatpak install -y flathub org.freedesktop.Platform.GL.$gl_slug \\"
+        warn "                            org.freedesktop.Platform.GL32.$gl_slug"
+        warn "GL32 is not optional -- Wine needs the 32-bit libraries for 32-bit plugins."
     fi
 
     # WINELOADER can only enter a session at login.

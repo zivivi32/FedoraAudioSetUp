@@ -116,6 +116,17 @@ adds `~/.local/share/yabridge` to `PATH`. Both are conditional, so the wrapper
 is unchanged in behaviour when yabridge is not installed, and the two halves of
 `~/fedora44-setup` stay decoupled.
 
+The `PATH` append is guarded against re-adding itself. The systemd `--user`
+manager outlives a logout, so an unguarded append grew `PATH` by one duplicate
+entry per login — harmless, but it accumulates for as long as the user manager
+stays up, and stale entries from an older version of this wrapper can outlive
+the line that created them.
+
+Note there is no `yabridge` executable to find on that `PATH`; yabridge ships
+`yabridgectl` and the two `yabridge-host*.exe` hosts. `yabridgectl` is also
+reachable from any session via the `~/.local/bin` wrapper, so `command not
+found` for `yabridge` means the command name, not the `PATH`.
+
 This is deliberately *not* `~/.config/environment.d/wineloader.conf`, which the
 wineloader project recommends: under greetd the systemd `--user` manager starts
 before this wrapper, reads the **shared** `~/.config/environment.d`, and would

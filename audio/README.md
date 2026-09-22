@@ -38,11 +38,12 @@ session, portal or `~/.config` changes, so the Hyprland/Plasma split is unaffect
 | `/etc/security/limits.d/99-audio.conf` | on | `@pipewire` rtprio 90, nice -19, memlock unlimited. `99-` so it is read *after* Fedora's `25-pw-rlimits.conf` and wins |
 | `/etc/sysctl.d/90-audio.conf` | on | swappiness 10, inotify watches 600000 — a drop-in instead of appending to `sysctl.conf` |
 | add you to `pipewire` group | on | The group exists and is empty; this is what makes rtprio 90 reachable |
-| REAPER (portable, `~/REAPER`) | on | Skipped if `~/REAPER` exists. `--no-reaper` to skip |
+| REAPER (portable, `~/REAPER`) | on | Skipped if `~/REAPER` exists. `--no-reaper` to skip. The launcher entry is repaired on every run — see below |
 | full `dnf update` | **off** | `--update`. Off by default because it would also pull Hyprland updates from the `lionheartp` COPR |
 | `realtime-setup` + `realtime` group | **off** | `--realtime-setup`. Largely redundant: rtprio limits already apply to every process you own |
 | mask `rtkit-daemon` | **off** | `--mask-rtkit`, and it refuses unless the rtprio limit is verified ≥ 90 |
 | yabridge + Bottles + wineloader | **off** | `--yabridge`, scoped to the Plasma session. See below |
+| route unrouted Wine prefixes | **off** | `--route-prefixes`, with `--route-runner NAME`. Reported by `--check` either way |
 
 Everything is idempotent — re-running changes nothing already in place.
 
@@ -72,7 +73,41 @@ For the yabridge/Bottles half:
 ./install-audio.sh --yabridge   # then follow the manual Bottles steps it prints
 ```
 
+`--check` also reports the three things that install cleanly and still do not
+work — the REAPER launcher entry, the GPU driver inside the Bottles Flatpak,
+and the Wine each registered prefix actually routes to:
+
+```
+REAPER launcher entry:   ok (~/.local/share/applications/cockos-reaper.desktop)
+bottles GPU driver:      ok
+prefix routing:          /home/olivier/.wine    -> kron4ek-wine-9.21-staging-tkg-amd64
+prefix routing:          /home/olivier/.wine-ni -> SYSTEM WINE (no bottle.yml)
+```
+
 Runs either as your user (using `sudo` per step) or under `sudo`/`pkexec`.
+
+## REAPER's launcher entry
+
+REAPER installs with `--integrate-desktop`, which calls `xdg-desktop-menu`. On
+this system that writes the entry to `~/.gnome/apps/` — a path nothing has read
+since GNOME 2 — and tags it `OnlyShowIn=Old;` so modern menus skip it as a
+duplicate of a modern copy that is never written. The result is that REAPER
+installs perfectly and does not appear in the launcher at all.
+
+Copying the file into `~/.local/share/applications/` is not enough on its own:
+`OnlyShowIn=Old` restricts it to a desktop environment that does not exist, so
+every desktop still hides it. Both have to be fixed together.
+
+The script writes a correct entry, then refreshes `update-desktop-database` and
+`kbuildsycoca6`. It runs on **every** pass, not just a fresh install, because
+the broken entry is left behind in place — an install from months ago is
+exactly the case that needs repairing. It is reported by `--check` as
+`REAPER launcher entry:`.
+
+The icons are fine; REAPER's own installer puts `cockos-reaper.svg` into the
+user icon themes correctly. Only the `.desktop` file lands in the wrong place.
+The stale `~/.gnome/apps` copy is left alone — it is inert, and deleting it is
+cosmetic.
 
 ## yabridge with Bottles (`--yabridge`)
 
@@ -215,6 +250,59 @@ the development build of yabridge is mandatory on this machine rather than a
 preference. The script registers `~/.wine-ni` automatically when it exists,
 but never creates directories inside it: Native Access owns that prefix.
 
+The trap is that the fallback is **silent**. `yabridgectl sync` reports every
+plugin as synced either way, because sync and routing never consult each other:
+sync records one global Wine version, while routing is decided per prefix, at
+load time, purely by whether `bottle.yml` is present. A prefix can be fully
+synced and still be running on a Wine two major versions from the one it was
+bridged against, with no warning anywhere.
+
+So `--check` reports the routing of every registered prefix, and
+`--route-prefixes` fixes the ones that fall back by writing a `bottle.yml` into
+them:
+
+```bash
+./install-audio.sh --yabridge --route-prefixes
+./install-audio.sh --yabridge --route-prefixes --route-runner kron4ek-wine-9.21-staging-tkg-amd64
+```
+
+`wineloader.sh` reads exactly two keys from that file — `.Runner`, the runner to
+exec, and `.Path`, whose basename only has to match an existing Bottle so
+`BOTTLES_ROOT` resolves. Bottles never scans these prefixes, so they do not
+become visible Bottles, and the file disappears with the prefix.
+
+Leave `~/.wine-ni` unrouted unless you have a reason: ni-wine wants Wine >= 11
+and the fallback gives it exactly that. Routing is for prefixes whose plugins
+you bridge and want on a specific runner.
+
+### Bottles needs a GPU driver inside the Flatpak
+
+Bottles owns the Wine runner here, so a Bottles that will not open is not a
+cosmetic problem — there is no other way to install or change a runner.
+
+It is a Flatpak, so it cannot see the host's graphics driver: it needs a
+matching `org.freedesktop.Platform.GL.nvidia-<driver>` extension. Without one
+it falls back to the Mesa/nouveau stack, which cannot talk to a proprietary
+`nvidia` kernel module, and Bottles dies on its first window with
+`BadDrawable (invalid Pixmap or Window parameter)` — after logging
+`Bottles Started!`, which makes it look like a Bottles bug rather than a
+missing driver.
+
+The extension version must match the running driver **exactly**, so a driver
+upgrade breaks it again until the matching extension is pulled in. The script
+checks for both and prints the install command:
+
+```bash
+flatpak install -y flathub \
+  org.freedesktop.Platform.GL.nvidia-<driver> \
+  org.freedesktop.Platform.GL32.nvidia-<driver>
+```
+
+`GL32` is not optional — Wine needs the 32-bit libraries for 32-bit plugins,
+and plenty of Native Instruments plugin code is still 32-bit. Installing only
+the 64-bit half gets Bottles to open while leaving plugins broken. Reported by
+`--check` as `bottles GPU driver:`.
+
 ### You must log in again before plugins will load
 
 `WINELOADER` can only enter a session at login, and the wrapper decides whether
@@ -225,14 +313,25 @@ variable is simply not there yet. The script detects this by reading
 so loudly.
 
 Until you log out and back in, plugins are bridged against the **system** Wine
-instead of the Bottle's runner. You can see which one was used:
+instead of the Bottle's runner.
+
+Do **not** try to check that with `grep wine_version …/yabridgectl/config.toml`.
+That field is written from a plain `wine --version` probe with no `WINEPREFIX`
+set, so it never goes through the shim and never reports a Bottle runner — it
+reads `wine-11.0 (Staging)` even when routing is working perfectly. It is
+yabridgectl's "you upgraded Wine, re-sync" hint and nothing more.
+
+Ask the shim instead, per prefix, since that is what actually decides:
 
 ```bash
-grep wine_version ~/.config-plasma/yabridgectl/config.toml
+WINEPREFIX=~/.wine  ~/.local/bin/wineloader.sh --version
 ```
 
-After logging back in, run `yabridgectl sync` once more so that line records
-the Bottle's runner instead of `wine-11.0`.
+or let the script list every registered prefix at once:
+
+```bash
+./install-audio.sh --check      # see the "prefix routing:" lines
+```
 
 ### Then
 

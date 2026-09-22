@@ -24,7 +24,10 @@ if [[ -x "${HOME}/.local/bin/wineloader.sh" ]]; then
 fi
 # yabridgectl on PATH, so it is managed from inside the session that uses it.
 # Its config lives in $XDG_CONFIG_HOME/yabridgectl, i.e. the isolated one.
-if [[ -d "${HOME}/.local/share/yabridge" ]]; then
+# Guarded: the systemd --user manager outlives a logout, so an unguarded append
+# re-ran on every login and PATH grew a duplicate entry each time.
+if [[ -d "${HOME}/.local/share/yabridge" \
+   && ":${PATH}:" != *":${HOME}/.local/share/yabridge:"* ]]; then
     export PATH="${PATH}:${HOME}/.local/share/yabridge"
 fi
 
